@@ -67,7 +67,7 @@ def _version_meta(version_data):
 
 def _event_brief(event, version_data):
     """事件单版本原貌（新增/删除条目用）。"""
-    return {
+    item = {
         "uid": event.get("uid"),
         "name": event.get("name"),
         "earliest_start": event.get("earliest_start"),
@@ -78,6 +78,10 @@ def _event_brief(event, version_data):
         "draft": _is_draft(event),
         "window": _window_of(version_data, event),
     }
+    origin = event.get("origin")
+    if isinstance(origin, dict):
+        item["origin"] = origin  # 并入事件：展示保存的来源摘要（仅展示，不参与差值）
+    return item
 
 
 def _diff_event(uid, from_event, to_event, from_data, to_data):
@@ -100,7 +104,7 @@ def _diff_event(uid, from_event, to_event, from_data, to_data):
             and from_draft == to_draft
             and from_event.get("name") == to_event.get("name")):
         return None
-    return {
+    entry = {
         "uid": uid,
         "name": {"from": from_event.get("name"), "to": to_event.get("name")},
         "draft": {"from": from_draft, "to": to_draft},
@@ -108,6 +112,12 @@ def _diff_event(uid, from_event, to_event, from_data, to_data):
         "window": {"from": from_win, "to": to_win},
         "window_changes": window_changes,
     }
+    # 来源摘要随持续身份走：两端都有时以较晚版本为准展示；来源变化不作为
+    # “输入差值”（来源摘要本就不应被改写），只在条目上展示保存的摘要。
+    origin = to_event.get("origin") or from_event.get("origin")
+    if isinstance(origin, dict):
+        entry["origin"] = origin
+    return entry
 
 
 def _relations_by_pair(events, relations):
@@ -217,10 +227,17 @@ def build_compare(from_data, to_data):
             continue
         fe, te = f_by_uid[uid], e
         if fe.get("name") != te.get("name"):
-            renamed.append({"uid": uid, "from": fe.get("name"), "to": te.get("name")})
+            rename = {"uid": uid, "from": fe.get("name"), "to": te.get("name")}
+            origin = te.get("origin") or fe.get("origin")
+            if isinstance(origin, dict):
+                rename["origin"] = origin
+            renamed.append(rename)
         entry = _diff_event(uid, fe, te, from_data, to_data)
         if entry is None:
-            unchanged.append({"uid": uid, "name": te.get("name")})
+            same = {"uid": uid, "name": te.get("name")}
+            if isinstance(te.get("origin"), dict):
+                same["origin"] = te["origin"]
+            unchanged.append(same)
         else:
             changed.append(entry)
 

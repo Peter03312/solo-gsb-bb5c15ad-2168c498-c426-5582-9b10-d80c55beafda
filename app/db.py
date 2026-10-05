@@ -12,7 +12,9 @@ snapshots 记录，留存当时的标题、事件、“先于”关系输入，�
 跨复盘并入（merge）：预览只读组装合并输入并推算；确认在一个事务内完成版本
 核对、digest 核对、整体替换、重新推算与新快照写入（kind=merge，记录来源
 复盘/版本），失败回滚，绝不产生部分写入。复制事件由 _replace_input 分配
-全新 uid，目标原有事件与来源历史均不变。
+全新 uid，并固化与该新身份绑定的**来源摘要**（origin_json：来源复盘
+id/标题、来源版本、来源事件 uid/名称）；摘要随之后的普通保存/恢复沿用，
+目标原有事件与来源历史均不变，来源被删除后仍只展示已保存的摘要、不回读。
 """
 
 import json
@@ -49,7 +51,12 @@ CREATE TABLE IF NOT EXISTS events (
     duration_minutes INTEGER,
     note            TEXT NOT NULL DEFAULT '',
     timezone        TEXT,                          -- IANA 时区名；NULL = 未指定时区（旧语义）
-    uid             TEXT                           -- 跨版本持续身份，保存/恢复时沿用
+    uid             TEXT,                          -- 跨版本持续身份，保存/恢复时沿用
+    -- 跨复盘并入来源摘要（不可变 JSON 快照）：仅并入产生的事件非 NULL。
+    -- 内容在并入确认时一次性固化（来源复盘 id/标题、来源版本、来源事件 uid/名称），
+    -- 此后只读展示：来源复盘或来源版本被删除/改名后仍显示这里保存的摘要，
+    -- 绝不回读来源、不改写来源历史；与推算完全无关。
+    origin_json     TEXT
 );
 CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +128,46 @@ def _new_uid():
     return uuid.uuid4().hex
 
 
+def make_origin(source_review_id, source_review_title, source_version,
+                source_event_uid, source_event_name):
+    """组装跨复盘并入事件的来源摘要（并入确认时一次性固化到目标事件）。
+
+    摘要是纯展示用的不可变副本：来源复盘标题、来源事件名称都按并入当时的
+    内容保存，之后来源复盘/版本被删除或改名也不回读、不改写。
+    """
+    return {
+        "source_review_id": source_review_id,
+        "source_review_title": source_review_title,
+        "source_version": source_version,
+        "source_event_uid": source_event_uid,
+        "source_event_name": source_event_name,
+    }
+
+
+def _origin_of(row_or_event):
+    """从 live 行（origin_json）或快照事件（origin）读取来源摘要；无则 None。"""
+    raw = row_or_event.get("origin_json")
+    if raw:
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    origin = row_or_event.get("origin")
+    return origin if isinstance(origin, dict) else None
+
+
+def _event_view(row):
+    """live 事件行 → 对外视图：origin_json 展平为嵌套 origin（无来源则不带）。"""
+    view = dict(row)
+    raw = view.pop("origin_json", None)
+    if raw:
+        try:
+            view["origin"] = json.loads(raw)
+        except (TypeError, ValueError):
+            pass
+    return view
+
+
 def init_db(db_path):
     """启动时初始化数据库（建目录、建表、老库结构迁移）。"""
     directory = os.path.dirname(os.path.abspath(db_path))
@@ -146,6 +193,10 @@ def _migrate(conn):
     events.timezone 同为可空迁移列：旧行与旧快照没有该列（视为未指定
     时区），继续按朴素本地时间的既有语义处理，绝不回填时区。
 
+    events.origin_json 同为可空迁移列：仅并入产生的事件携带来源摘要，
+    旧行与旧快照没有来源信息（视为非并入事件，不显示来源），绝不回填、
+    不回读来源复盘。
+
     snapshots.source_review_id 同为可空迁移列：并入产生的版本用它记录
     来源复盘，旧快照该列为 NULL。
     """
@@ -163,6 +214,9 @@ def _migrate(conn):
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
     if "timezone" not in event_cols:
         conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
+    if "origin_json" not in event_cols:
+        # 并入事件的来源摘要；旧行没有来源信息（非并入事件不显示来源）
+        conn.execute("ALTER TABLE events ADD COLUMN origin_json TEXT")
     snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
     if "source_review_id" not in snap_cols:
         # 并入产生的版本需记录来源复盘；旧快照该列为 NULL
@@ -207,7 +261,7 @@ def get_bundle(db_path, review_id):
         review = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
         if review is None:
             raise NotFound(review_id)
-        events = [dict(r) for r in conn.execute(
+        events = [_event_view(r) for r in conn.execute(
             "SELECT * FROM events WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
         relations = [dict(r) for r in conn.execute(
             "SELECT * FROM relations WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
@@ -425,16 +479,22 @@ def _current_input(conn, review_id):
     relations = [dict(r) for r in conn.execute(
         "SELECT * FROM relations WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
     key_by_id = {e["id"]: "id_" + str(e["id"]) for e in events}
-    snapshot_events = [{
-        "key": key_by_id[e["id"]],
-        "uid": e.get("uid"),
-        "name": e["name"],
-        "earliest_start": e["earliest_start"],
-        "latest_start": e["latest_start"],
-        "duration_minutes": e["duration_minutes"],
-        "note": e["note"],
-        "timezone": e.get("timezone"),
-    } for e in events]
+    snapshot_events = []
+    for e in events:
+        item = {
+            "key": key_by_id[e["id"]],
+            "uid": e.get("uid"),
+            "name": e["name"],
+            "earliest_start": e["earliest_start"],
+            "latest_start": e["latest_start"],
+            "duration_minutes": e["duration_minutes"],
+            "note": e["note"],
+            "timezone": e.get("timezone"),
+        }
+        origin = _origin_of(e)
+        if origin is not None:
+            item["origin"] = origin  # 并入事件：来源摘要随不可变快照留存
+        snapshot_events.append(item)
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     return events, relations, snapshot_events, snapshot_relations
 
@@ -453,16 +513,22 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         " VALUES (?,?,?,?,?)",
         (review_id, version, result["status"], json.dumps(result, ensure_ascii=False), now))
     key_by_id = {e["id"]: "id_" + str(e["id"]) for e in events}
-    snapshot_events = [{
-        "key": key_by_id[e["id"]],
-        "uid": e.get("uid"),
-        "name": e["name"],
-        "earliest_start": e["earliest_start"],
-        "latest_start": e["latest_start"],
-        "duration_minutes": e["duration_minutes"],
-        "note": e["note"],
-        "timezone": e.get("timezone"),
-    } for e in events]
+    snapshot_events = []
+    for e in events:
+        item = {
+            "key": key_by_id[e["id"]],
+            "uid": e.get("uid"),
+            "name": e["name"],
+            "earliest_start": e["earliest_start"],
+            "latest_start": e["latest_start"],
+            "duration_minutes": e["duration_minutes"],
+            "note": e["note"],
+            "timezone": e.get("timezone"),
+        }
+        origin = _origin_of(e)
+        if origin is not None:
+            item["origin"] = origin  # 并入事件：来源摘要随不可变快照留存
+        snapshot_events.append(item)
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     input_json = json.dumps(
         {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
@@ -479,6 +545,11 @@ def _replace_input(conn, review_id, events, relations):
 
     每个事件可携带 uid（持续身份）：携带且未重复时沿用，否则现场分配新
     uid。行号每次保存都会重建，只有 uid 能跨版本识别同一事件。
+
+    事件可携带服务端内部生成的嵌套 origin（并入事件的来源摘要）：原样
+    固化为 origin_json；没有来源的事件该列为 NULL。客户端无法直接提供
+    origin（HTTP 校验层只取固定字段），保存时由 _resolve_event_uids 按
+    uid 从既有行重新关联，防止丢失或伪造。
     """
     conn.execute("DELETE FROM events WHERE review_id=?", (review_id,))
     conn.execute("DELETE FROM relations WHERE review_id=?", (review_id,))
@@ -489,11 +560,15 @@ def _replace_input(conn, review_id, events, relations):
         if not uid or uid in used_uids:
             uid = _new_uid()
         used_uids.add(uid)
+        origin = e.get("origin")
+        origin_json = json.dumps(origin, ensure_ascii=False) if isinstance(origin, dict) else None
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note, timezone, uid) VALUES (?,?,?,?,?,?,?,?)",
+            " duration_minutes, note, timezone, uid, origin_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", ""), e.get("timezone"), uid))
+             e.get("duration_minutes"), e.get("note", ""), e.get("timezone"), uid,
+             origin_json))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")
@@ -505,20 +580,39 @@ def _replace_input(conn, review_id, events, relations):
 
 
 def _resolve_event_uids(conn, review_id, events):
-    """保存前解析每个事件的持续身份（uid）。
+    """保存前解析每个事件的持续身份（uid）与并入来源摘要（origin）。
 
     客户端回传的 uid 属于本复盘当前事件且未重复时沿用（改名、调整时间
     后仍是同一事件）；否则（新事件、未知或伪造的 uid）分配新 uid。
     绝不按名称或会重建的行号猜配。
+
+    并入事件的来源摘要同样按 uid 从既有 live 行关联回来：客户端只回传
+    uid、不回传 origin，服务端在此**先丢弃事件自带 origin，再**把与该
+    身份绑定的已保存来源重新挂上（未知/新身份则无来源）。因此再次保存、
+    改名、调整时间都不会丢失来源，而客户端无法伪造或篡改来源；来源摘要
+    始终以服务端已保存的为准。
     """
     rows = conn.execute(
-        "SELECT uid FROM events WHERE review_id=?", (review_id,)).fetchall()
-    known = {r["uid"] for r in rows if r["uid"]}
+        "SELECT uid, origin_json FROM events WHERE review_id=?", (review_id,)).fetchall()
+    known = {}
+    for r in rows:
+        if r["uid"]:
+            origin = None
+            if r["origin_json"]:
+                try:
+                    origin = json.loads(r["origin_json"])
+                except (TypeError, ValueError):
+                    origin = None
+            known[r["uid"]] = origin
     used = set()
     for e in events:
+        e.pop("origin", None)  # 客户端不得携带来源；合法来源只从服务端既有行关联
         uid = e.get("uid")
         if uid and uid in known and uid not in used:
             e["uid"] = uid
+            origin = known[uid]
+            if origin is not None:
+                e["origin"] = origin  # 来源摘要随持续身份保留（再次保存不丢失）
         else:
             e["uid"] = _new_uid()
         used.add(e["uid"])
@@ -631,7 +725,7 @@ def _preview_payload(plan, target, source, source_data, target_id, source_id, so
     src_by_uid = {e["uid"]: e for e in source_data["input"]["events"]}
 
     def copied_event_view(e):
-        return {
+        view = {
             "uid": e.get("uid"),
             "name": e.get("name"),
             "earliest_start": e.get("earliest_start"),
@@ -640,6 +734,14 @@ def _preview_payload(plan, target, source, source_data, target_id, source_id, so
             "note": e.get("note") or "",
             "timezone": e.get("timezone"),
         }
+        # 预览即展示该事件确认后的来源摘要（只读；不参与 digest/推算）。
+        # 始终指向**直接来源**版本中的事件身份：即使来源事件本身也是更早
+        # 并入来的，也不沿用其传递来源（不回读、不改写来源历史）。
+        # 标题取来源版本不可变快照中的标题（与回看该来源版本所见一致）。
+        view["origin"] = make_origin(
+            source_id, source_data.get("title") or source["title"],
+            source_version, e.get("uid"), e.get("name"))
+        return view
 
     copied_relations = []
     for r in plan["copied_relations"]:
@@ -696,6 +798,11 @@ def merge_into_review(db_path, target_id, source_id, source_version,
     MergeRejected。复制事件保留时间范围/持续/备注/时区与 UTC 偏移，在
     目标取得全新持续身份；关系保留等待上下界。目标原有事件与来源历史不变。
     冲突或暂存的合并结果允许保存为草稿，但仍不得定稿。
+
+    每个复制事件在换发新 uid 的同时固化一份**来源摘要**（来源复盘 id/标题、
+    来源版本、来源事件 uid/名称，均取并入当时的值）并写入 live 行与不可变
+    快照；来源摘要之后只随 uid 关联（普通保存/恢复不丢失），不回读来源，
+    来源复盘或版本删除后仍可展示，也不影响任何推算。
     """
     conn = connect(db_path)
     try:
@@ -711,8 +818,28 @@ def merge_into_review(db_path, target_id, source_id, source_version,
                 "合并内容与预览不一致（目标可能已重新保存，或选择/来源版本被改动），"
                 "请重新预览后再确认")
 
-        events, relations = merge.save_payload(plan)
+        events, relations = merge.save_payload(
+            plan, source_meta={
+                "review_id": source_id,
+                # 来源复盘标题按来源版本不可变快照中的标题固化（与预览、与
+                # 回看该来源版本所见一致；之后来源改名/删除均不影响本摘要）
+                "review_title": _source_data.get("title") or _source["title"],
+                "version": source_version,
+                "event_names": {
+                    e.get("uid"): e.get("name")
+                    for e in _source_data["input"].get("events", []) if e.get("uid")},
+            })
+        # save_payload 已为复制事件生成来源摘要，但身份解析（普通保存也用它）
+        # 会清空事件自带 origin、只从既有 live 行关联。先解析身份（目标事件
+        # 沿用、复制事件换发新 uid），再由这里——并入确认，来源摘要唯一的
+        # 服务端注入点——把来源摘要重新挂到复制事件上。
+        copied_origins = {e["key"]: e.get("origin") for e in events
+                          if e.get("key", "").startswith("m_") and e.get("origin")}
         _resolve_event_uids(conn, target_id, events)
+        for e in events:
+            origin = copied_origins.get(e.get("key"))
+            if origin is not None:
+                e["origin"] = origin  # 新持续身份与来源摘要绑定
         _replace_input(conn, target_id, events, relations)
         live_events, live_relations, _, _ = _current_input(conn, target_id)
 

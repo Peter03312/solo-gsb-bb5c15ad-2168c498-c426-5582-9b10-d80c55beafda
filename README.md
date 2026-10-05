@@ -71,6 +71,13 @@
     关系保留**最短/最长等待**；复制事件在目标取得**全新持续身份（uid）**，
     不沿用来源 uid；目标原有事件与来源复盘的历史均不变（跨复盘也不会按
     uid 配对，只复制输入本身）；
+  - 每个复制事件同时保留**来源摘要**（来源复盘 id 与并入当时的标题、来源
+    版本、来源事件 uid 与并入当时的名称），与该事件在目标取得的**新持续
+    身份绑定**：当前事件详情、**版本回看**与**版本对照**都能查看来源；
+    之后再次保存、改名、恢复为新草稿都**不会丢失**。摘要是并入当时的只读
+    副本，**来源复盘或来源版本被删除后仍照常显示**，不回读、不改写来源
+    历史；来源展示不改变目标事件与任何推算结果；**非并入事件不显示来源**，
+    客户端也无法伪造或篡改来源（保存只回传 uid，来源由服务端按身份关联）；
   - 来源与目标相同、入选事件不存在、来源版本缺少输入快照（旧库历史版本）、
     输入不合法一律拒绝（400/404/422）且**无部分写入**；目标版本过期沿用
     **409** 语义；合并结果有冲突或暂存事件时**仍可保存为草稿，但不得定稿**；
@@ -138,6 +145,7 @@ python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（
 python3 tests/test_merge.py    # 跨复盘并入规划单元测试（两端入选关系、字段保留、新身份、digest）
 python3 tests/test_merge_db.py # 并入持久化测试（预览只读、确认新草稿、409/400、冲突暂存不得定稿）
 python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+python3 tests/test_merge_origin.py # 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示、非并入事件无来源）
 python3 tests/test_diagnose.py  # 冲突最小约束组分析单元测试（差分约束负环、极小性、时区绝对分钟、排除项、稳定性）
 python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 ```
@@ -161,8 +169,8 @@ python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极
 | POST | `/api/reviews/{id}/versions/{v}/restore` | 恢复为新草稿版本 `{base_version}`；过期返回 409，旧库无快照返回 422 |
 | GET | `/api/reviews/{id}/versions/{v}/diagnosis` | 该版本冲突的最小不可满足约束组分析（只读，按不可变快照）：整组不可满足、去掉任一条可满足；无冲突 `groups` 为空；版本不存在 404、旧库无快照 422 |
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
-| POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
-| POST | `/api/reviews/{id}/merge/confirm` | 确认并入，一次性另存为目标新草稿版本：`{source_review_id, source_version, event_uids, base_version, digest}`；目标过期 409、digest 与预览不符 400 |
+| POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件（每个带 `origin` 来源摘要）、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
+| POST | `/api/reviews/{id}/merge/confirm` | 确认并入，一次性另存为目标新草稿版本：`{source_review_id, source_version, event_uids, base_version, digest}`；复制事件取得全新 uid 且其 `origin` 保存来源复盘/版本/来源事件身份与名称（之后保存、恢复不丢失；来源被删后仍显示保存摘要）；目标过期 409、digest 与预览不符 400 |
 | DELETE | `/api/reviews/{id}` | 删除复盘 |
 
 ### 版本回看与恢复（HTTP 示例）
@@ -348,10 +356,14 @@ curl -s -X POST http://localhost:8000/api/reviews/2/merge/preview \
 #   "copied_events": [
 #     {"uid": "afc915...", "name": "来源告警",
 #      "earliest_start": "2026-10-01T09:00", "latest_start": "2026-10-01T09:00",
-#      "duration_minutes": 15, "note": "源备注", "timezone": null},
+#      "duration_minutes": 15, "note": "源备注", "timezone": null,
+#      "origin": {"source_review_id": 1, "source_review_title": "来源复盘",
+#                 "source_version": 2, "source_event_uid": "afc915...",
+#                 "source_event_name": "来源告警"}},
 #     {"uid": "9253c0...", "name": "来源响应",
 #      "earliest_start": "2026-10-01T09:00", "latest_start": "2026-10-01T12:00",
-#      "duration_minutes": 30, "note": "", "timezone": null}],
+#      "duration_minutes": 30, "note": "", "timezone": null,
+#      "origin": {...同上...}}],
 #   "copied_relations": [
 #     {"predecessor": {"uid": "afc915...", "name": "来源告警"},
 #      "successor":   {"uid": "9253c0...", "name": "来源响应"},
@@ -386,6 +398,30 @@ curl -s -X POST http://localhost:8000/api/reviews/2/merge/confirm \
 新 uid）。合并结果若为冲突或含暂存事件，确认仍会成功保存为新草稿，但
 `finalize` 照旧返回 400。并入产生的版本可回看，其快照类型为 `merge`，
 版本列表条目中带 `source_review_id` 与 `source_version`。
+
+**复制事件的来源摘要（origin）**：确认成功后，`GET /api/reviews/{id}` 中每个
+复制事件都带 `origin`，目标原有事件没有该字段：
+
+```json
+{"uid": "<目标分配的全新uid>", "name": "来源告警", ...,
+ "origin": {"source_review_id": 1, "source_review_title": "来源复盘",
+            "source_version": 2,
+            "source_event_uid": "afc915...",
+            "source_event_name": "来源告警"}}
+```
+
+- `origin` 与复制事件在目标的**新 uid 绑定**（`source_event_uid` 仍是来源版本
+  中的旧 uid，仅用于溯源），并进入该版本**不可变输入快照**：版本回看
+  （`GET .../versions/{v}` 的 `input.events[]`）与版本对照（新增/改名/变化/
+  未变事件条目）都能看到；恢复为新草稿时随快照沿用。
+- 之后普通保存（PUT）只需回传 uid：服务端按身份把已保存的 `origin` 关联回来，
+  改名、改时间、多次保存都不丢失；请求体里夹带的 `origin` 会被服务端忽略，
+  非并入事件永远不会出现来源信息。
+- 摘要按并入当时固化：之后来源复盘改名、来源版本被删（或整个来源复盘被删除，
+  其 `snapshots`/`computations` 随外键级联删除）都**不影响展示**——目标只显示
+  自己保存的摘要，绝不回读来源、也不改写来源历史。
+- `origin` 纯展示：不参与 digest，不进入推算，目标事件输入与推算窗口、冲突/
+  暂存结论均不因来源展示而改变。
 
 ### “先于”关系的间隔设置（HTTP 示例）
 
@@ -564,6 +600,7 @@ tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
 tests/test_merge.py    并入规划单元测试（两端入选关系、字段保留、新身份、digest 稳定性）
 tests/test_merge_db.py 并入持久化测试（预览只读、确认原子新草稿、409/400、冲突暂存不得定稿）
 tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+tests/test_merge_origin.py 并入事件来源摘要测试（来源与新身份绑定、再保存/恢复/对照保留、来源删除后仍显示）
 tests/test_diagnose.py 冲突最小约束组分析单元测试（负环、极小性、时区绝对分钟、排除项、稳定性）
 tests/test_api_diagnose.py 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 Dockerfile / docker-compose.yml / .dockerignore

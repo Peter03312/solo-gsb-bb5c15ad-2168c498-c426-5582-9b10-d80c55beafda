@@ -77,6 +77,7 @@ function resetEdits() {
     key: "id_" + e.id,
     id: e.id,
     uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
+    origin: e.origin || null,  // 并入事件的来源摘要（只读展示，不参与编辑/提交）
     name: e.name,
     timezone: e.timezone || "",
     earliest_start: e.earliest_start || "",
@@ -138,6 +139,19 @@ function timeInputHtml(field, tz) {
   return `<input data-f="${field}" type="datetime-local">`;
 }
 
+/* 并入事件的来源摘要：只读徽标（来源复盘/版本被删除后仍显示保存的摘要）。
+   非并入事件（无 origin）返回空串，页面上不出现任何来源信息。 */
+function originBadgeHtml(origin) {
+  if (!origin) return "";
+  const title =
+    `来源复盘：#${origin.source_review_id} ${origin.source_review_title || ""}（v${origin.source_version}）\n` +
+    `来源事件：「${origin.source_event_name || ""}」\n来源事件身份：${origin.source_event_uid}`;
+  return `<div class="origin-tag" title="${escapeHtml(title)}">` +
+    `⇲ 并入自 #${escapeHtml(String(origin.source_review_id))} ` +
+    `${escapeHtml(origin.source_review_title || "（复盘已删除）")} ` +
+    `v${escapeHtml(String(origin.source_version))} · 「${escapeHtml(origin.source_event_name || "（事件已删除）")}」</div>`;
+}
+
 function renderEventsTable() {
   const tbody = $("#events-table tbody");
   tbody.innerHTML = "";
@@ -145,7 +159,7 @@ function renderEventsTable() {
     const tr = document.createElement("tr");
     tr.dataset.key = e.key;
     tr.innerHTML =
-      `<td><input data-f="name" type="text" value=""></td>` +
+      `<td><input data-f="name" type="text" value="">${originBadgeHtml(e.origin)}</td>` +
       `<td><input data-f="timezone" class="tz" type="text" list="tz-list"` +
       ` placeholder="留空=不指定"></td>` +
       `<td>${timeInputHtml("earliest_start", e.timezone)}</td>` +
@@ -298,9 +312,13 @@ function buildResultHtml(res, evByKey, analysisVersion) {
 
   let drafts = "";
   if (nDraft > 0) {
-    drafts = `<div class="section-title">暂存事件（不参与推算）</div>` + res.drafts.map((d) =>
-      `<div class="card draft"><h3>「${escapeHtml(d.name)}」</h3>` +
-      `<div class="reason">${escapeHtml(d.reason)}</div></div>`).join("");
+    drafts = `<div class="section-title">暂存事件（不参与推算）</div>` + res.drafts.map((d) => {
+      const src = evByKey[d.id] || evByKey[String(d.id)];
+      const originLine = src && src.origin ? originBadgeHtml(src.origin) : "";
+      return `<div class="card draft"><h3>「${escapeHtml(d.name)}」</h3>` +
+        (originLine ? `<div class="origin-line">${originLine}</div>` : "") +
+        `<div class="reason">${escapeHtml(d.reason)}</div></div>`;
+    }).join("");
   }
 
   let skipped = "";
@@ -320,8 +338,11 @@ function buildResultHtml(res, evByKey, analysisVersion) {
         const dur = ev ? ev.duration_minutes : "";
         const tz = w.timezone || (ev ? ev.timezone : "") || "";
         const tzTag = tz ? ` <span class="tz-tag">${escapeHtml(tz)}</span>` : "";
+        const originLine = ev && ev.origin
+          ? `<div class="origin-line">${originBadgeHtml(ev.origin)}</div>` : "";
         return `<div class="card">` +
           `<h3>「${escapeHtml(name)}」${tzTag} <span class="window">${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}</span></h3>` +
+          originLine +
           `<div class="hint">可行结束窗口：${w.earliest_end.replace("T", " ")} ~ ${w.latest_end.replace("T", " ")}` +
           (dur === null || dur === undefined || dur === "" ? "" : `（持续 ${dur} 分钟）`) + `</div>` +
           `<details><summary>最早可行开始的依据链</summary>${chainHtml(w.earliest_chain)}</details>` +
@@ -566,7 +587,7 @@ function renderVersionDetail(detail) {
   for (const e of events) byKey[e.key] = e;
 
   const rows = events.map((e) =>
-    `<tr><td>${escapeHtml(e.name)}</td>` +
+    `<tr><td>${escapeHtml(e.name)}${originBadgeHtml(e.origin)}</td>` +
     `<td>${escapeHtml(e.timezone || "")}</td>` +
     `<td>${fmtTime(e.earliest_start)}</td>` +
     `<td>${fmtTime(e.latest_start)}</td>` +
@@ -584,7 +605,6 @@ function renderVersionDetail(detail) {
   const winIndex = {};
   for (const e of events) winIndex[String(e.key).replace(/^id_/, "")] = e;
   const parts = buildResultHtml(detail.result, winIndex, detail.version);
-
   return `<div class="section-title">当时输入（不可变快照）</div>` +
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
     `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
@@ -695,6 +715,7 @@ function eventBriefHtml(e, tag) {
   return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」` +
     (e.timezone ? ` <span class="tz-tag">${escapeHtml(e.timezone)}</span>` : "") +
     (e.draft ? ` <span class="badge warn">暂存</span>` : "") + `</h3>` +
+    (e.origin ? `<div class="origin-line">${originBadgeHtml(e.origin)}</div>` : "") +
     `<div class="hint">输入范围：${fmtVal(e.earliest_start).replace("T", " ")} ~ ` +
     `${fmtVal(e.latest_start).replace("T", " ")}` +
     (e.duration_minutes === null || e.duration_minutes === undefined
@@ -721,7 +742,9 @@ function compareDiffHtml(data) {
   if (ev.renamed.length) {
     html += `<div class="section-title">改名事件（同一事件，按持续身份配对）</div>` +
       ev.renamed.map((r) =>
-        `<div class="card diff-rename">「${escapeHtml(r.from)}」→「${escapeHtml(r.to)}」</div>`).join("");
+        `<div class="card diff-rename">「${escapeHtml(r.from)}」→「${escapeHtml(r.to)}」` +
+        (r.origin ? `<div class="origin-line">${originBadgeHtml(r.origin)}</div>` : "") +
+        `</div>`).join("");
   }
   if (ev.changed.length) {
     html += `<div class="section-title">输入与推算窗口变化</div>` + ev.changed.map((c) => {
@@ -729,7 +752,8 @@ function compareDiffHtml(data) {
         (c.name.from !== c.name.to ? ` → 「${escapeHtml(c.name.to)}」` : "") +
         (c.draft.from !== c.draft.to
           ? ` <span class="badge warn">${c.draft.to ? "变为暂存" : "已补齐"}</span>` : "") +
-        `</h3>`;
+        `</h3>` +
+        (c.origin ? `<div class="origin-line">${originBadgeHtml(c.origin)}</div>` : "");
       const inputRows = changeRows(c.input_changes, INPUT_FIELD_LABELS, true);
       if (inputRows) {
         card += `<table class="cmp"><thead><tr><th>输入</th><th>v${data.from.version}</th>` +
@@ -746,8 +770,15 @@ function compareDiffHtml(data) {
     }).join("");
   }
   if (ev.unchanged.length) {
+    const originHits = ev.unchanged.filter((e) => e.origin);
     html += `<details><summary>未变化事件（${ev.unchanged.length}）</summary><div class="hint">` +
-      ev.unchanged.map((e) => `「${escapeHtml(e.name)}」`).join("、") + `</div></details>`;
+      ev.unchanged.map((e) => `「${escapeHtml(e.name)}」`).join("、") + `</div>` +
+      (originHits.length
+        ? `<div class="section-title">其中并入事件的来源</div>` +
+          originHits.map((e) =>
+            `<div class="card"><h3>「${escapeHtml(e.name)}」</h3>` +
+            `<div class="origin-line">${originBadgeHtml(e.origin)}</div></div>`).join("")
+        : "") + `</details>`;
   }
 
   const rel = data.relations;
@@ -957,6 +988,7 @@ function mergeResultEvByKey(data) {
     map["s_" + e.uid] = {
       name: e.name, timezone: e.timezone,
       duration_minutes: e.duration_minutes,
+      origin: e.origin || null,
     };
   }
   return map;

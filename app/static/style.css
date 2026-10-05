@@ -92,6 +92,15 @@ td .row-del { padding: 2px 8px; }
   font-family: ui-monospace, monospace; font-weight: normal;
 }
 
+/* 并入事件的来源摘要：只读徽标（当前详情/版本回看/版本对照共用） */
+.origin-line { margin: 4px 0; }
+.origin-tag {
+  display: inline-block; font-size: 11px; line-height: 1.5;
+  padding: 1px 8px; margin-top: 3px; border-radius: 9px;
+  border: 1px solid #b58900; color: #8a6d00; background: #fdf6e3;
+  cursor: help; max-width: 100%;
+}
+
 .relation-add { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .relation-add select { max-width: 220px; }
 .gap-field { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }

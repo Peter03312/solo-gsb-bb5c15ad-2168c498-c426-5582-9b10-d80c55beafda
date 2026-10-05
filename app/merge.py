@@ -181,13 +181,30 @@ def build_plan(target_snapshot_events, target_live_events, target_live_relations
     }
 
 
-def save_payload(plan):
+def save_payload(plan, source_meta=None):
     """由规划生成写库用的整体替换输入（客户端 key 形式）。
 
     目标事件沿用原 key（id_<行id>）与 uid；复制事件使用新 key 且**不带
     uid**——写库时由服务端分配全新的持续身份，因此复制事件在目标中绝不
     沿用来源身份。目标关系与复制来的关系统一改按新 key 引用。
+
+    source_meta 给定时（并入确认，由 db 层传入），每个复制事件附带嵌套
+    origin 来源摘要：{source_review_id, source_review_title, source_version,
+    source_event_uid, source_event_name}。该摘要与复制事件在目标取得的
+    全新 uid 绑定，之后随身份保留；它不参与 digest，也不影响推算。
     """
+    def origin_for(src_uid):
+        if not source_meta:
+            return None
+        name = source_meta.get("event_names", {}).get(src_uid)
+        return {
+            "source_review_id": source_meta["review_id"],
+            "source_review_title": source_meta["review_title"],
+            "source_version": source_meta["version"],
+            "source_event_uid": src_uid,
+            "source_event_name": name,
+        }
+
     token_to_key = {}
     events = []
     for e in plan["target_snapshot_events"]:
@@ -206,7 +223,7 @@ def save_payload(plan):
     for i, e in enumerate(plan["copied_events"]):
         new_key = "m_{}_{}".format(i, str(e["uid"])[:8])
         token_to_key[source_token(e["uid"])] = new_key
-        events.append({
+        item = {
             "key": new_key,
             "uid": "",  # 强制在目标分配新持续身份
             "name": e.get("name"),
@@ -215,7 +232,12 @@ def save_payload(plan):
             "duration_minutes": e.get("duration_minutes"),
             "note": e.get("note") or "",
             "timezone": e.get("timezone"),
-        })
+        }
+        origin = origin_for(e["uid"])
+        if origin is not None:
+            # 来源摘要随复制事件固化；与新 uid 绑定，来源被删/改名后仍可读
+            item["origin"] = origin
+        events.append(item)
 
     relations = []
     for r in plan["target_live_relations"]:

@@ -286,6 +286,84 @@ def test_timezone_offsets_preserved_over_http():
     assert e["latest_start"] == "2026-11-01T12:00-05:00"
 
 
+def test_origin_provenance_preserved_across_detail_versions_resave():
+    sid, suids = make_source()
+    tid, tbundle = make_target()
+    target_uid = tbundle["events"][0]["uid"]
+    chosen = [suids["来源告警"]]
+
+    status, pv = preview(tid, sid, 2, chosen)
+    assert status == 200
+    # 预览复制事件即携带来源摘要（来源复盘/版本/来源事件身份与名称）
+    o = pv["copied_events"][0]["origin"]
+    assert o == {
+        "source_review_id": sid, "source_review_title": "来源复盘",
+        "source_version": 2, "source_event_uid": suids["来源告警"],
+        "source_event_name": "来源告警"}
+
+    status, b = confirm(tid, sid, 2, chosen, 2, pv["digest"])
+    assert status == 200
+    by_name = {e["name"]: e for e in b["events"]}
+    assert "origin" not in by_name["目标已有"]                 # 非并入事件无来源
+    alarm = by_name["来源告警"]
+    assert alarm["origin"] == o
+    assert alarm["uid"] != suids["来源告警"]                    # 新持续身份仍关联来源
+
+    # 版本回看 v3：不可变快照事件带来源摘要
+    status, v3 = req("GET", "/api/reviews/{}/versions/3".format(tid))
+    assert status == 200
+    sv3 = {e["name"]: e for e in v3["input"]["events"]}
+    assert sv3["来源告警"]["origin"] == o and "origin" not in sv3["目标已有"]
+
+    # 版本对照 v2 → v3：新增事件条目带来源摘要
+    status, cmp_ = req("GET", "/api/reviews/{}/compare?from=2&to=3".format(tid))
+    assert status == 200 and cmp_["pairable"]
+    added = {e["name"]: e for e in cmp_["events"]["added"]}
+    assert added["来源告警"]["origin"] == o
+
+    # 再次保存（改名，uid 回传）：来源不丢失；客户端夹带的伪造 origin 被拒绝
+    put_events = [{
+        "key": "id_" + str(e["id"]), "uid": e["uid"],
+        "name": "告警改名" if e["name"] == "来源告警" else e["name"],
+        "earliest_start": e["earliest_start"], "latest_start": e["latest_start"],
+        "duration_minutes": e["duration_minutes"], "note": e["note"],
+        "origin": {"source_review_id": 999, "source_event_name": "伪造"},
+    } for e in b["events"]]
+    status, b4 = req("PUT", "/api/reviews/{}".format(tid), {
+        "base_version": 3, "title": "目标复盘",
+        "events": put_events, "relations": []})
+    assert status == 200
+    by4 = {e["name"]: e for e in b4["events"]}
+    assert by4["告警改名"]["origin"] == o
+    assert by4["告警改名"]["uid"] == alarm["uid"]
+    assert "origin" not in by4["目标已有"]
+
+    # 恢复 v3 为新草稿 v5：来源摘要随快照恢复
+    status, b5 = req("POST", "/api/reviews/{}/versions/3/restore".format(tid),
+                     {"base_version": 4})
+    assert status == 200
+    assert next(e for e in b5["events"] if e["name"] == "来源告警")["origin"] == o
+
+
+def test_origin_still_shown_after_source_deleted():
+    sid, suids = make_source()
+    tid, _ = make_target()
+    _, pv = preview(tid, sid, 2, [suids["来源告警"]])
+    status, _ = confirm(tid, sid, 2, [suids["来源告警"]], 2, pv["digest"])
+    assert status == 200
+    # 删除来源复盘（其版本一并级联删除）：目标当前详情与历史回看仍显示摘要
+    status, _ = req("DELETE", "/api/reviews/{}".format(sid))
+    assert status == 200
+    _, b = req("GET", "/api/reviews/{}".format(tid))
+    alarm = next(e for e in b["events"] if e["name"] == "来源告警")
+    assert alarm["origin"]["source_review_id"] == sid
+    assert alarm["origin"]["source_review_title"] == "来源复盘"
+    status, v3 = req("GET", "/api/reviews/{}/versions/3".format(tid))
+    assert status == 200
+    assert any(e.get("origin", {}).get("source_review_id") == sid
+               for e in v3["input"]["events"])
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

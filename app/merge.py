@@ -5,6 +5,11 @@
 最短/最长等待。复制来的事件在目标中取得**全新的持续身份（uid）**，绝不沿用
 来源 uid；目标原有事件与来源复盘的历史均不变。
 
+每个复制事件另带一份**来源摘要**（source_meta + 来源事件身份）：来源复盘
+id 与当时标题、来源版本、来源事件 uid 与当时名称。确认并入时随事件写入
+目标，此后与目标分配的新持续身份关联；它只是展示元数据，不参与推算与
+digest，来源复盘或版本被删除后仍按已保存的摘要展示。
+
 本模块只做规划与推算，不写库：
   - build_plan(...)  组装合并输入、运行推算，产出预览数据与 digest；
   - save_payload(plan) 生成写库用的整体替换输入（客户端 key 形式）。
@@ -58,15 +63,19 @@ def _gap_max(r):
 
 
 def build_plan(target_snapshot_events, target_live_events, target_live_relations,
-               source_data, selected_uids):
+               source_data, selected_uids, source_meta=None):
     """按选择组装合并规划并推算。
 
     target_snapshot_events : _current_input 给出的目标快照式事件
-                             （key=id_<行id>、uid、时间/持续/备注/时区）
+                             （key=id_<行id>、uid、时间/持续/备注/时区/来源摘要）
     target_live_events     : 目标 live 事件行（数字 id）
     target_live_relations  : 目标 live 关系行（数字 id 与间隔上下界）
     source_data            : 来源版本的不可变回看数据（含 input 快照）
     selected_uids          : 入选来源事件的持续身份列表
+    source_meta            : 来源摘要元信息 {review_id, review_title, version}；
+                             提供时每个复制事件在 copied_sources 中带上完整
+                             来源摘要（含来源事件 uid 与当时名称）；缺省时
+                             copied_sources 全为 None（纯规划用途）
 
     返回规划 dict（copied_* / compute_* / result / digest 等，见模块函数）。
     选择为空、重复、标识非法或来源快照中找不到对应事件时抛 MergeError。
@@ -97,6 +106,21 @@ def build_plan(target_snapshot_events, target_live_events, target_live_relations
 
     # 复制事件按来源快照中的出现顺序排列（与客户端选择顺序无关，保证可复现）
     copied_events = [e for e in src_events if e.get("uid") in selected_set]
+
+    # 每个复制事件的来源摘要：来源复盘/版本（source_meta）+ 来源事件身份。
+    # 只是展示元数据，不进入下方的推算输入与 digest。
+    copied_sources = []
+    for e in copied_events:
+        if source_meta:
+            copied_sources.append({
+                "review_id": source_meta.get("review_id"),
+                "review_title": source_meta.get("review_title"),
+                "version": source_meta.get("version"),
+                "event_uid": e.get("uid"),
+                "event_name": e.get("name"),
+            })
+        else:
+            copied_sources.append(None)
 
     # 仅复制两端均入选的“先于”关系，同样按来源快照顺序，保留等待上下界
     uid_by_key = {e.get("key"): e.get("uid") for e in src_events}
@@ -174,6 +198,7 @@ def build_plan(target_snapshot_events, target_live_events, target_live_relations
         "target_live_relations": target_live_relations,
         "copied_events": copied_events,
         "copied_relations": copied_relations,
+        "copied_sources": copied_sources,
         "compute_events": compute_events,
         "compute_relations": compute_relations,
         "result": result,
@@ -184,9 +209,10 @@ def build_plan(target_snapshot_events, target_live_events, target_live_relations
 def save_payload(plan):
     """由规划生成写库用的整体替换输入（客户端 key 形式）。
 
-    目标事件沿用原 key（id_<行id>）与 uid；复制事件使用新 key 且**不带
-    uid**——写库时由服务端分配全新的持续身份，因此复制事件在目标中绝不
-    沿用来源身份。目标关系与复制来的关系统一改按新 key 引用。
+    目标事件沿用原 key（id_<行id>）与 uid，并原样携带其已有的来源摘要；
+    复制事件使用新 key 且**不带 uid**——写库时由服务端分配全新的持续身份，
+    因此复制事件在目标中绝不沿用来源身份，但随事件带上本次并入的来源摘要
+    （与即将分配的新身份关联）。目标关系与复制来的关系统一改按新 key 引用。
     """
     token_to_key = {}
     events = []
@@ -200,9 +226,11 @@ def save_payload(plan):
             "duration_minutes": e.get("duration_minutes"),
             "note": e.get("note") or "",
             "timezone": e.get("timezone"),
+            "source": e.get("source"),
         })
         token_to_key[target_token(str(e["key"])[3:])] = e["key"]
 
+    copied_sources = plan.get("copied_sources") or [None] * len(plan["copied_events"])
     for i, e in enumerate(plan["copied_events"]):
         new_key = "m_{}_{}".format(i, str(e["uid"])[:8])
         token_to_key[source_token(e["uid"])] = new_key
@@ -215,6 +243,7 @@ def save_payload(plan):
             "duration_minutes": e.get("duration_minutes"),
             "note": e.get("note") or "",
             "timezone": e.get("timezone"),
+            "source": copied_sources[i],  # 来源摘要随复制事件写入目标
         })
 
     relations = []

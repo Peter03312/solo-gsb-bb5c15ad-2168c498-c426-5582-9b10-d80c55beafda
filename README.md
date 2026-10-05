@@ -77,6 +77,20 @@
   - 并入产生的新版本在版本列表标注「并入产生」并记录来源复盘与来源版本，
     可正常回看、恢复、对照。网页在「历史版本」面板提供来源选择、事件勾选、
     预览与确认的完整操作。
+- **并入事件来源溯源（本轮新增）**：确认并入时，每个复制事件随事件保存一份
+  **来源摘要**（`source`：来源复盘 id 与当时标题、来源版本、来源事件 uid 与
+  当时名称），并与该事件在目标取得的**新持续身份**关联：
+  - **当前事件详情**（`GET /api/reviews/{id}` 的 `events[].source`）、
+    **版本回看**（`GET /api/reviews/{id}/versions/{v}` 的
+    `input.events[].source`）与**版本对照**（对照响应 `events` 的
+    added/removed/changed/unchanged 条目）均可查看来源信息；
+  - **再次保存**（按 uid 继承，客户端无需也不能回传来源）、**恢复**（沿快照
+    写回）、**定稿**（沿用 live 行）均不丢失来源摘要；
+  - 来源复盘或来源版本被删除后，仍展示**已保存的来源摘要**——展示一律使用
+    随事件保存的摘要，**不回读、不改写来源历史**；
+  - 来源摘要只是展示元数据：**不参与推算、对照差值判定与合并 digest**，
+    目标事件及推算结果不因来源展示而改变；**非并入事件** `source` 恒为
+    `null`，不显示来源信息。
 - **冲突最小约束组分析（本轮新增）**：在某个**可回看版本**的冲突结果中，
   一键定位一组（或多组相互独立的）**不可再缩减的冲突输入**：按该版本的
   **不可变快照**把每个非暂存事件的最早/最晚开始边界与每条“先于”关系的
@@ -138,6 +152,8 @@ python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（
 python3 tests/test_merge.py    # 跨复盘并入规划单元测试（两端入选关系、字段保留、新身份、digest）
 python3 tests/test_merge_db.py # 并入持久化测试（预览只读、确认新草稿、409/400、冲突暂存不得定稿）
 python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+python3 tests/test_provenance.py # 并入来源溯源持久化测试（摘要保留、保存/恢复/删除来源、对照展示）
+python3 tests/test_provenance_api.py # 来源溯源 HTTP API 端到端测试（详情/回看/对照可见、伪造忽略）
 python3 tests/test_diagnose.py  # 冲突最小约束组分析单元测试（差分约束负环、极小性、时区绝对分钟、排除项、稳定性）
 python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 ```
@@ -387,6 +403,44 @@ curl -s -X POST http://localhost:8000/api/reviews/2/merge/confirm \
 `finalize` 照旧返回 400。并入产生的版本可回看，其快照类型为 `merge`，
 版本列表条目中带 `source_review_id` 与 `source_version`。
 
+### 并入事件来源溯源（本轮新增，HTTP 示例）
+
+确认并入后，每个复制事件随事件保存一份**来源摘要** `source`，并与它在目标
+取得的**新持续身份（uid）**关联；非并入事件的 `source` 为 `null`：
+
+```bash
+# 1) 确认并入后查看当前事件详情：复制事件带来源摘要
+curl -s http://localhost:8000/api/reviews/2
+# {"events": [
+#   {"id": 4, "uid": "t_目标...", "name": "目标已有", ..., "source": null},
+#   {"id": 5, "uid": "9c1e...（目标新身份）", "name": "来源告警", ...,
+#    "source": {"review_id": 1, "review_title": "来源复盘", "version": 2,
+#               "event_uid": "afc915...（来源事件 uid）",
+#               "event_name": "来源告警"}}, ...], ...}
+
+# 2) 版本回看：并入产生版本的不可变快照同样带来源摘要
+curl -s http://localhost:8000/api/reviews/2/versions/3
+#  "input": {"events": [{"key": "id_5", "uid": "9c1e...", "name": "来源告警",
+#                        ..., "source": {"review_id": 1, "version": 2, ...}}], ...}
+
+# 3) 版本对照：added/removed/changed/unchanged 事件条目均带 source
+curl -s 'http://localhost:8000/api/reviews/2/compare?from=2&to=3'
+#  "events": {"added": [{"uid": "9c1e...", "name": "来源告警",
+#                        "source": {"review_id": 1, "version": 2, ...}, ...}], ...}
+```
+
+来源摘要的存续规则：
+
+- **再次保存**：客户端只需回传 `uid`，服务端按持续身份继承来源摘要；
+  客户端回传的 `source` 一律被忽略（来源摘要由服务端权威维护，无法伪造
+  或改写）；**恢复**沿快照写回、**定稿**沿用 live 行，均不丢失；
+- **来源复盘或来源版本被删除后**：详情、回看、对照仍展示已保存的摘要
+  （含并入时的来源标题与事件名称），不回读、不改写来源历史；
+- 来源摘要只是展示元数据：不参与推算、对照差值判定与合并 `digest`，
+  目标事件及推算结果不因来源展示而改变；
+- 旧库迁移为 `events` 表补 `source_json` 列，旧行与旧快照一律无来源
+  （非并入事件语义），不回填。
+
 ### “先于”关系的间隔设置（HTTP 示例）
 
 每条关系可携带 `min_gap_minutes`（最短等待，非负整数分钟，缺省 0）与
@@ -548,8 +602,8 @@ curl -s -X PUT http://localhost:8000/api/reviews/1 \
 ```
 app/
   server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照与并入路由
-  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务
-  merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、合并推算与 digest；预览/确认共用）
+  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务、并入来源摘要存取
+  merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、来源摘要、合并推算与 digest；预览/确认共用）
   compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
   diagnose.py        版本冲突最小不可满足约束组分析（差分约束图负环、删除式收缩保证极小性，只读）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
@@ -564,6 +618,8 @@ tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
 tests/test_merge.py    并入规划单元测试（两端入选关系、字段保留、新身份、digest 稳定性）
 tests/test_merge_db.py 并入持久化测试（预览只读、确认原子新草稿、409/400、冲突暂存不得定稿）
 tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+tests/test_provenance.py 并入来源溯源持久化测试（摘要随身份延续、保存/恢复/定稿/删除来源）
+tests/test_provenance_api.py 来源溯源 HTTP API 端到端测试（详情/回看/对照可见、伪造被忽略）
 tests/test_diagnose.py 冲突最小约束组分析单元测试（负环、极小性、时区绝对分钟、排除项、稳定性）
 tests/test_api_diagnose.py 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 Dockerfile / docker-compose.yml / .dockerignore

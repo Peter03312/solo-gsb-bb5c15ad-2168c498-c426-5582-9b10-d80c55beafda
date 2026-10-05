@@ -13,6 +13,13 @@ snapshots 记录，留存当时的标题、事件、“先于”关系输入，�
 核对、digest 核对、整体替换、重新推算与新快照写入（kind=merge，记录来源
 复盘/版本），失败回滚，绝不产生部分写入。复制事件由 _replace_input 分配
 全新 uid，目标原有事件与来源历史均不变。
+
+并入来源溯源（provenance）：确认并入时，每个复制事件在 events.source_json
+留存一份**已保存的来源摘要**（来源复盘 id 与当时标题、来源版本、来源事件
+uid 与当时名称）。该摘要随事件持续身份（uid）延续：再次保存按 uid 继承、
+恢复沿快照写回、定稿沿用 live 行，均不丢失；来源复盘或来源版本被删除后
+仍展示已保存的摘要，绝不回读或改写来源历史。非并入事件该列恒为 NULL，
+不展示来源信息；来源摘要只是展示元数据，不参与推算与 digest。
 """
 
 import json
@@ -49,7 +56,8 @@ CREATE TABLE IF NOT EXISTS events (
     duration_minutes INTEGER,
     note            TEXT NOT NULL DEFAULT '',
     timezone        TEXT,                          -- IANA 时区名；NULL = 未指定时区（旧语义）
-    uid             TEXT                           -- 跨版本持续身份，保存/恢复时沿用
+    uid             TEXT,                          -- 跨版本持续身份，保存/恢复时沿用
+    source_json     TEXT                           -- 并入来源摘要（JSON）；NULL = 非并入事件
 );
 CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,6 +156,10 @@ def _migrate(conn):
 
     snapshots.source_review_id 同为可空迁移列：并入产生的版本用它记录
     来源复盘，旧快照该列为 NULL。
+
+    events.source_json 同为可空迁移列：并入产生的复制事件用它留存来源摘要
+    （来源复盘 id/标题、来源版本、来源事件 uid/名称），旧行一律 NULL，
+    视为非并入事件，不回填、不猜配。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
     if "min_gap_minutes" not in cols:
@@ -163,6 +175,9 @@ def _migrate(conn):
             conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
     if "timezone" not in event_cols:
         conn.execute("ALTER TABLE events ADD COLUMN timezone TEXT")
+    if "source_json" not in event_cols:
+        # 并入来源摘要：仅确认并入时由服务端写入；旧行 NULL = 非并入事件
+        conn.execute("ALTER TABLE events ADD COLUMN source_json TEXT")
     snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
     if "source_review_id" not in snap_cols:
         # 并入产生的版本需记录来源复盘；旧快照该列为 NULL
@@ -177,6 +192,23 @@ def connect(db_path):
 
 
 # ---------------------------------------------------------------------- 读取
+
+def _event_source(row):
+    """从 live 事件行解析并入来源摘要（JSON dict）；非并入事件返回 None。
+
+    摘要字段：review_id / review_title（并入时的来源复盘 id 与标题）、
+    version（来源版本号）、event_uid / event_name（来源事件身份与当时名称）。
+    展示一律使用这份已保存的摘要，绝不回读来源复盘的当前或历史数据。
+    """
+    raw = row.get("source_json")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
 
 def current_version(db_path, review_id):
     conn = connect(db_path)
@@ -207,8 +239,13 @@ def get_bundle(db_path, review_id):
         review = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
         if review is None:
             raise NotFound(review_id)
-        events = [dict(r) for r in conn.execute(
-            "SELECT * FROM events WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
+        events = []
+        for r in conn.execute(
+                "SELECT * FROM events WHERE review_id=? ORDER BY id", (review_id,)):
+            e = dict(r)
+            e["source"] = _event_source(e)   # 并入来源摘要；非并入事件为 None
+            e.pop("source_json", None)       # 对外只暴露解析后的 source
+            events.append(e)
         relations = [dict(r) for r in conn.execute(
             "SELECT * FROM relations WHERE review_id=? ORDER BY id", (review_id,)).fetchall()]
         comp = conn.execute(
@@ -434,6 +471,7 @@ def _current_input(conn, review_id):
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
         "timezone": e.get("timezone"),
+        "source": _event_source(e),
     } for e in events]
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     return events, relations, snapshot_events, snapshot_relations
@@ -462,6 +500,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
         "timezone": e.get("timezone"),
+        "source": _event_source(e),
     } for e in events]
     snapshot_relations = _snapshot_relations(relations, key_by_id)
     input_json = json.dumps(
@@ -479,6 +518,8 @@ def _replace_input(conn, review_id, events, relations):
 
     每个事件可携带 uid（持续身份）：携带且未重复时沿用，否则现场分配新
     uid。行号每次保存都会重建，只有 uid 能跨版本识别同一事件。
+    事件可携带 source（并入来源摘要 dict）：有值时随事件写入 source_json，
+    与其持续身份关联；无值（非并入事件）写入 NULL。
     """
     conn.execute("DELETE FROM events WHERE review_id=?", (review_id,))
     conn.execute("DELETE FROM relations WHERE review_id=?", (review_id,))
@@ -489,11 +530,14 @@ def _replace_input(conn, review_id, events, relations):
         if not uid or uid in used_uids:
             uid = _new_uid()
         used_uids.add(uid)
+        source = e.get("source")
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note, timezone, uid) VALUES (?,?,?,?,?,?,?,?)",
+            " duration_minutes, note, timezone, uid, source_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", ""), e.get("timezone"), uid))
+             e.get("duration_minutes"), e.get("note", ""), e.get("timezone"), uid,
+             json.dumps(source, ensure_ascii=False) if source else None))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")
@@ -524,6 +568,25 @@ def _resolve_event_uids(conn, review_id, events):
         used.add(e["uid"])
 
 
+def _inherit_event_sources(conn, review_id, events):
+    """再次保存时按持续身份（uid）继承已有事件的并入来源摘要。
+
+    来源摘要由服务端在确认并入时写入，并随事件身份延续：客户端保存只需
+    回传 uid，不必（也不能）回传来源信息；身份未变（uid 沿用）即继承，
+    新身份（新 uid）的事件一律没有来源摘要。须在 uid 解析之后调用。
+    """
+    rows = conn.execute(
+        "SELECT uid, source_json FROM events WHERE review_id=?", (review_id,)).fetchall()
+    by_uid = {r["uid"]: r["source_json"] for r in rows
+              if r["uid"] and r["source_json"]}
+    for e in events:
+        if e.get("source"):
+            continue
+        raw = by_uid.get(e.get("uid"))
+        if raw:
+            e["source"] = json.loads(raw)
+
+
 def update_review(db_path, review_id, base_version, title, events, relations):
     """整体替换某复盘的输入并重新推算。base_version 过期则抛 VersionConflict。"""
     conn = connect(db_path)
@@ -536,6 +599,7 @@ def update_review(db_path, review_id, base_version, title, events, relations):
             raise VersionConflict(row["version"])
 
         _resolve_event_uids(conn, review_id, events)
+        _inherit_event_sources(conn, review_id, events)  # 并入来源随身份延续
         _replace_input(conn, review_id, events, relations)
         live_events, live_relations, _, _ = _current_input(conn, review_id)
 
@@ -617,9 +681,15 @@ def _build_merge_plan(conn, target_id, source_id, source_version, selected_uids)
         raise NotFound(source_id)
     source_data = _version_snapshot(conn, source_id, source_version)  # 旧库缺快照抛 LegacyVersion
     _live_events, _live_relations, snap_events, _snap_rels = _current_input(conn, target_id)
+    # 复制事件的来源摘要：并入时的来源复盘 id/标题、来源版本（事件身份在规划内补全）
+    source_meta = {
+        "review_id": source_id,
+        "review_title": source_data.get("title") or source["title"],
+        "version": source_version,
+    }
     try:
         plan = merge.build_plan(snap_events, _live_events, _live_relations,
-                                source_data, selected_uids)
+                                source_data, selected_uids, source_meta)
     except merge.MergeError as e:
         # 纯规划层的输入不合法统一转为 db 层的并入拒绝（HTTP 400，无部分写入）
         raise MergeRejected(str(e))
@@ -694,7 +764,8 @@ def merge_into_review(db_path, target_id, source_id, source_version,
     目标版本未变化时重建规划的 digest 必须与预览一致（一致 ⇒ 合并输入相同
     ⇒ 推算结论与预览相同）；版本过期抛 VersionConflict；digest 不符抛
     MergeRejected。复制事件保留时间范围/持续/备注/时区与 UTC 偏移，在
-    目标取得全新持续身份；关系保留等待上下界。目标原有事件与来源历史不变。
+    目标取得全新持续身份，并随事件写入来源摘要（来源复盘/版本/来源事件
+    身份）；关系保留等待上下界。目标原有事件与来源历史不变。
     冲突或暂存的合并结果允许保存为草稿，但仍不得定稿。
     """
     conn = connect(db_path)

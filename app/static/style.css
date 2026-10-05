@@ -91,6 +91,13 @@ td .row-del { padding: 2px 8px; }
   border: 1px solid var(--accent); color: var(--accent);
   font-family: ui-monospace, monospace; font-weight: normal;
 }
+/* 并入来源摘要标签（事件详情/版本回看/对照共用） */
+.src-tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 9px;
+  border: 1px solid var(--warn); color: var(--warn);
+  font-weight: normal; white-space: nowrap; cursor: help;
+}
+.src-line { margin-top: 3px; }
 
 .relation-add { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .relation-add select { max-width: 220px; }

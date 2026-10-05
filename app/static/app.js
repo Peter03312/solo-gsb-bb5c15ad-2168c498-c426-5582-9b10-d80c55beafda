@@ -77,6 +77,7 @@ function resetEdits() {
     key: "id_" + e.id,
     id: e.id,
     uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
+    source: e.source || null,  // 并入来源摘要（只读展示；保存由服务端按 uid 继承）
     name: e.name,
     timezone: e.timezone || "",
     earliest_start: e.earliest_start || "",
@@ -95,6 +96,20 @@ function resetEdits() {
 }
 
 /* ---------------------------------------------------------------- 渲染 */
+
+/* 并入来源摘要展示：一律使用随事件保存的摘要（来源被删除也不回读来源历史） */
+function sourceText(s) {
+  return `并入自复盘 #${s.review_id}「${s.review_title || ""}」v${s.version}` +
+    ` · 来源事件「${s.event_name || ""}」`;
+}
+function sourceTitle(s) {
+  return `${sourceText(s)}（来源事件 uid：${s.event_uid || ""}）`;
+}
+function sourceTagHtml(s) {
+  if (!s) return "";
+  return `<span class="src-tag" title="${escapeHtml(sourceTitle(s))}">` +
+    `⧉ 并入自 #${escapeHtml(String(s.review_id))} v${escapeHtml(String(s.version))}</span>`;
+}
 
 function eventName(key) {
   const e = state.editEvents.find((x) => x.key === key);
@@ -145,7 +160,8 @@ function renderEventsTable() {
     const tr = document.createElement("tr");
     tr.dataset.key = e.key;
     tr.innerHTML =
-      `<td><input data-f="name" type="text" value=""></td>` +
+      `<td><input data-f="name" type="text" value="">` +
+      (e.source ? `<div class="src-line">${sourceTagHtml(e.source)}</div>` : "") + `</td>` +
       `<td><input data-f="timezone" class="tz" type="text" list="tz-list"` +
       ` placeholder="留空=不指定"></td>` +
       `<td>${timeInputHtml("earliest_start", e.timezone)}</td>` +
@@ -571,7 +587,8 @@ function renderVersionDetail(detail) {
     `<td>${fmtTime(e.earliest_start)}</td>` +
     `<td>${fmtTime(e.latest_start)}</td>` +
     `<td>${e.duration_minutes === null || e.duration_minutes === undefined ? "—" : e.duration_minutes}</td>` +
-    `<td>${escapeHtml(e.note || "")}</td></tr>`).join("");
+    `<td>${escapeHtml(e.note || "")}</td>` +
+    `<td>${e.source ? sourceTagHtml(e.source) : "—"}</td></tr>`).join("");
 
   const rels = (detail.input.relations || []).map((r) => {
     const a = byKey[r.predecessor_key], b = byKey[r.successor_key];
@@ -587,7 +604,7 @@ function renderVersionDetail(detail) {
 
   return `<div class="section-title">当时输入（不可变快照）</div>` +
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
-    `<th>持续(分钟)</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table>` +
+    `<th>持续(分钟)</th><th>备注</th><th>来源</th></tr></thead><tbody>${rows}</tbody></table>` +
     `<div class="section-title">“先于”关系</div><div class="vm-relations">${rels}</div>` +
     `<div class="section-title">当时推算依据与结果</div>` +
     parts.summary + parts.conflicts + parts.drafts + parts.skipped + parts.windows;
@@ -694,7 +711,9 @@ function compareRawHtml(data) {
 function eventBriefHtml(e, tag) {
   return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」` +
     (e.timezone ? ` <span class="tz-tag">${escapeHtml(e.timezone)}</span>` : "") +
-    (e.draft ? ` <span class="badge warn">暂存</span>` : "") + `</h3>` +
+    (e.draft ? ` <span class="badge warn">暂存</span>` : "") +
+    (e.source ? " " + sourceTagHtml(e.source) : "") + `</h3>` +
+    (e.source ? `<div class="hint">${escapeHtml(sourceText(e.source))}</div>` : "") +
     `<div class="hint">输入范围：${fmtVal(e.earliest_start).replace("T", " ")} ~ ` +
     `${fmtVal(e.latest_start).replace("T", " ")}` +
     (e.duration_minutes === null || e.duration_minutes === undefined
@@ -729,7 +748,11 @@ function compareDiffHtml(data) {
         (c.name.from !== c.name.to ? ` → 「${escapeHtml(c.name.to)}」` : "") +
         (c.draft.from !== c.draft.to
           ? ` <span class="badge warn">${c.draft.to ? "变为暂存" : "已补齐"}</span>` : "") +
+        (c.source ? " " + sourceTagHtml(c.source) : "") +
         `</h3>`;
+      if (c.source) {
+        card += `<div class="hint">${escapeHtml(sourceText(c.source))}</div>`;
+      }
       const inputRows = changeRows(c.input_changes, INPUT_FIELD_LABELS, true);
       if (inputRows) {
         card += `<table class="cmp"><thead><tr><th>输入</th><th>v${data.from.version}</th>` +
@@ -747,7 +770,9 @@ function compareDiffHtml(data) {
   }
   if (ev.unchanged.length) {
     html += `<details><summary>未变化事件（${ev.unchanged.length}）</summary><div class="hint">` +
-      ev.unchanged.map((e) => `「${escapeHtml(e.name)}」`).join("、") + `</div></details>`;
+      ev.unchanged.map((e) => e.source
+        ? `「${escapeHtml(e.name)}」${sourceTagHtml(e.source)}`
+        : `「${escapeHtml(e.name)}」`).join("、") + `</div></details>`;
   }
 
   const rel = data.relations;
@@ -969,7 +994,8 @@ function renderMergeModal(data) {
   $("#mm-meta").textContent =
     `预览只读，不改任何版本；确认时将基于目标 v${data.target.base_version} 重新核对，` +
     `目标未变化则结论与本预览一致，并一次性另存为目标的新草稿版本。` +
-    `来源历史与目标原有事件均不改变；复制事件在目标取得全新持续身份。`;
+    `来源历史与目标原有事件均不改变；复制事件在目标取得全新持续身份，并记录来源复盘、` +
+    `来源版本与来源事件身份（此后在事件详情、版本回看与对照中可查看，来源被删除也不丢失）。`;
 
   const evRows = data.copied_events.map((e) =>
     `<tr><td>${escapeHtml(e.name)}</td><td>${escapeHtml(e.timezone || "")}</td>` +

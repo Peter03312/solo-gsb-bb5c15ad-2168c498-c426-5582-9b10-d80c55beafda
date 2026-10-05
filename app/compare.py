@@ -7,8 +7,10 @@
 
 输入 from_data / to_data 为 db 层组装的两版数据：
   {version, kind, state, title, status, computed_at, input, result}
-其中 input 为不可变快照 {events, relations}（事件含 key 与 uid），
-result 为当时推算结果（windows 以当时行号为键，快照 key 形如 id_<行号>）。
+其中 input 为不可变快照 {events, relations}（事件含 key 与 uid，并入产生
+的事件另带 source 来源摘要），result 为当时推算结果（windows 以当时行号
+为键，快照 key 形如 id_<行号>）。来源摘要只是展示元数据：随事件身份附带
+在 added/removed/changed/unchanged 条目上，绝不参与差值判定。
 """
 
 # 参与对照的输入字段：(字段名, 展示名)
@@ -66,7 +68,7 @@ def _version_meta(version_data):
 
 
 def _event_brief(event, version_data):
-    """事件单版本原貌（新增/删除条目用）。"""
+    """事件单版本原貌（新增/删除条目用）。source 为并入来源摘要（如有）。"""
     return {
         "uid": event.get("uid"),
         "name": event.get("name"),
@@ -75,13 +77,18 @@ def _event_brief(event, version_data):
         "duration_minutes": event.get("duration_minutes"),
         "timezone": event.get("timezone"),
         "note": event.get("note") or "",
+        "source": event.get("source"),
         "draft": _is_draft(event),
         "window": _window_of(version_data, event),
     }
 
 
 def _diff_event(uid, from_event, to_event, from_data, to_data):
-    """同一身份事件的两版差值；无任何变化返回 None。"""
+    """同一身份事件的两版差值；无任何变化返回 None。
+
+    来源摘要（source）随事件身份恒定，只是展示元数据：不参与差值判定，
+    仅在有条目时附带，供对照视图展示。
+    """
     input_changes = {}
     for field, _label in INPUT_FIELDS:
         if from_event.get(field) != to_event.get(field):
@@ -100,10 +107,14 @@ def _diff_event(uid, from_event, to_event, from_data, to_data):
             and from_draft == to_draft
             and from_event.get("name") == to_event.get("name")):
         return None
+    source = to_event.get("source")
+    if source is None:
+        source = from_event.get("source")
     return {
         "uid": uid,
         "name": {"from": from_event.get("name"), "to": to_event.get("name")},
         "draft": {"from": from_draft, "to": to_draft},
+        "source": source,
         "input_changes": input_changes,
         "window": {"from": from_win, "to": to_win},
         "window_changes": window_changes,
@@ -220,7 +231,8 @@ def build_compare(from_data, to_data):
             renamed.append({"uid": uid, "from": fe.get("name"), "to": te.get("name")})
         entry = _diff_event(uid, fe, te, from_data, to_data)
         if entry is None:
-            unchanged.append({"uid": uid, "name": te.get("name")})
+            unchanged.append({"uid": uid, "name": te.get("name"),
+                              "source": te.get("source")})
         else:
             changed.append(entry)
 
